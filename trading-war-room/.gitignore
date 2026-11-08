@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+state/*.db
+state/*.db-*
+state/PIPELINE-EVIDENCE.jsonl
+state/handoff_notes.md
+!.gitkeep
