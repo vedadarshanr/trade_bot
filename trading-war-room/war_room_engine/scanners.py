@@ -37,9 +37,11 @@ try:
         bayesian_posterior as _hft_bayes,
         calc_imbalance as _hft_imb,
         calc_microprice as _hft_micro,
+        complement_book,
         compute_scalp_targets,
         mid_price as _hft_mid,
         quarter_kelly_scalp as _hft_kelly,
+        validate_long_targets,
     )
     from war_room_engine.paths import DB_PATH, EVIDENCE_PATH, STATE
     from war_room_engine.x_sentiment import (
@@ -120,6 +122,20 @@ except ImportError:  # pragma: no cover
     def mid_price(bid: float, ask: float) -> float:
         return (bid + ask) / 2.0
 
+    def complement_book(
+        bid: float, ask: float, q_bid: float, q_ask: float
+    ) -> tuple[float, float, float, float]:
+        no_bid = max(0.0, min(1.0, 1.0 - ask))
+        no_ask = max(0.0, min(1.0, 1.0 - bid))
+        return round(no_bid, 6), round(no_ask, 6), q_ask, q_bid
+
+    def validate_long_targets(entry: float, tp: float, sl: float) -> tuple[float, float]:
+        if tp <= entry:
+            tp = min(0.99, entry + 0.04)
+        if sl >= entry:
+            sl = max(0.001, entry - 0.03)
+        return round(tp, 6), round(sl, 6)
+
     def quarter_kelly_scalp(
         posterior_p: float,
         payout_odds_b: float | None = None,
@@ -160,7 +176,16 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 DEXSCREENER = "https://api.dexscreener.com/latest/dex/tokens"
 PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
-SOLANA_PUBLIC_RPC = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+try:
+    from war_room_engine.secrets import get_secret as _get_secret
+
+    SOLANA_PUBLIC_RPC = _get_secret(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
+except Exception:
+    SOLANA_PUBLIC_RPC = os.getenv(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
 
 IPFS_GATEWAYS = [
     "https://ipfs.io/ipfs/",
@@ -528,6 +553,7 @@ class PolymarketScanner:
             return None
 
         yes_token_id = str(clob_tokens[0])
+        no_token_id = str(clob_tokens[1]) if len(clob_tokens) > 1 else ""
         yes_mid_hint = float(outcome_prices[0]) if outcome_prices else 0.50
         slug = str(m.get("slug") or condition_id[:16])
         question = str(m.get("question") or slug)
@@ -558,54 +584,90 @@ class PolymarketScanner:
             and "say " not in question.lower()
         )
         is_potential_directional = 0.15 <= yes_mid_hint <= 0.85 and category_score >= 65.0
-        # Legacy safe-compounder path used by unit tests (no category gate)
         legacy_safe_hint = yes_mid_hint <= 0.20
 
         if not (sm_hits > 0 or is_potential_compounder or is_potential_directional or legacy_safe_hint):
             return None
 
-        tob = await self.fetch_top_of_book(http, yes_token_id)
-        if not tob:
+        yes_tob = await self.fetch_top_of_book(http, yes_token_id)
+        if not yes_tob:
             return None
-        bid, ask, q_bid, q_ask = tob
-        spread = round(ask - bid, 4)
-        if spread > 0.04 or ask <= bid:
+        yes_bid, yes_ask, yes_q_bid, yes_q_ask = yes_tob
+        yes_spread = round(yes_ask - yes_bid, 4)
+        if yes_spread > 0.04 or yes_ask <= yes_bid:
+            return None
+
+        yes_mid = round(mid_price(yes_bid, yes_ask), 4)
+        yes_micro = round(calc_microprice(yes_bid, yes_ask, yes_q_bid, yes_q_ask), 4)
+        yes_imb = calc_imbalance(yes_q_bid, yes_q_ask)
+        yes_edge = round(yes_micro - yes_mid, 4)
+
+        # Prefer live NO book when it is actually the complementary token.
+        # If the response looks like another YES-priced book, use the exact complement.
+        no_from_complement = complement_book(yes_bid, yes_ask, yes_q_bid, yes_q_ask)
+        no_tob = None
+        if no_token_id:
+            live_no = await self.fetch_top_of_book(http, no_token_id)
+            if live_no is not None:
+                live_mid = mid_price(live_no[0], live_no[1])
+                if yes_mid <= 0.55 and live_mid < 0.45:
+                    no_tob = no_from_complement
+                else:
+                    no_tob = live_no
+        if no_tob is None:
+            no_tob = no_from_complement
+        no_bid, no_ask, no_q_bid, no_q_ask = no_tob
+        no_spread = round(no_ask - no_bid, 4)
+
+        mode_a_qualified = (
+            (is_potential_compounder or legacy_safe_hint)
+            and no_ask > 0.80
+            and yes_ask <= 0.20
+        )
+        mode_b_qualified = (
+            is_potential_directional
+            and (abs(yes_imb) >= 0.25 or sm_hits > 0)
+            and (abs(yes_edge) >= 0.008 or sm_hits > 0)
+        )
+        orderbook_trigger = abs(yes_imb) >= 0.28 and abs(yes_micro - yes_mid) >= 0.015
+
+        if sm_hits > 0:
+            trigger = "smart_money_entry"
+            mode = "SCALP_DIRECTIONAL"
+            # Follow smart-money side when available; else YES-imbalance direction.
+            side = str(sm_side or "").upper()
+            if side not in ("YES", "NO"):
+                side = "YES" if yes_imb >= 0 else "NO"
+        elif mode_a_qualified:
+            trigger = "safe_compounder"
+            mode = "SAFE_COMPOUNDER"
+            side = "NO"
+        elif mode_b_qualified or orderbook_trigger:
+            trigger = "orderbook_imbalance"
+            mode = "SCALP_DIRECTIONAL"
+            side = "YES" if yes_imb >= 0 else "NO"
+        else:
+            return None
+
+        # Price EVERYTHING in the traded-side book (never YES mids for a NO trade).
+        if side == "NO":
+            bid, ask, q_bid, q_ask = no_bid, no_ask, no_q_bid, no_q_ask
+            spread = no_spread
+            book_source = "NO_TOKEN" if no_token_id and no_tob else "YES_COMPLEMENT"
+        else:
+            bid, ask, q_bid, q_ask = yes_bid, yes_ask, yes_q_bid, yes_q_ask
+            spread = yes_spread
+            book_source = "YES_TOKEN"
+
+        if spread > 0.04 or ask <= bid or ask <= 0:
             return None
 
         mid = round(mid_price(bid, ask), 4)
         microprice = round(calc_microprice(bid, ask, q_bid, q_ask), 4)
         imbalance = calc_imbalance(q_bid, q_ask)
         microprice_edge = round(microprice - mid, 4)
-        no_ask = 1.0 - bid
-
-        mode_a_qualified = (
-            (is_potential_compounder or legacy_safe_hint)
-            and no_ask > 0.80
-            and ask <= 0.20
-        )
-        # Soft imbalance for Mode A when book is already NO-heavy
-        if mode_a_qualified and imbalance > -0.05 and sm_hits == 0:
-            # Still allow classic safe compounder used in tests
-            pass
-
-        mode_b_qualified = (
-            is_potential_directional
-            and (abs(imbalance) >= 0.25 or sm_hits > 0)
-            and (abs(microprice_edge) >= 0.008 or sm_hits > 0)
-        )
-        orderbook_trigger = abs(imbalance) >= 0.28 and abs(microprice - mid) >= 0.015
-
-        if sm_hits > 0:
-            trigger = "smart_money_entry"
-            mode = "SCALP_DIRECTIONAL"
-        elif mode_a_qualified:
-            trigger = "safe_compounder"
-            mode = "SAFE_COMPOUNDER"
-        elif mode_b_qualified or orderbook_trigger:
-            trigger = "orderbook_imbalance"
-            mode = "SCALP_DIRECTIONAL"
-        else:
-            return None
+        # Cross the ask to enter a long on the traded token.
+        entry = float(ask)
 
         if self.sentiment_scorer is not None and hasattr(
             self.sentiment_scorer, "score_polymarket_candidate"
@@ -646,30 +708,34 @@ class PolymarketScanner:
             ln = 0.45 if x_vel >= 60 else 0.55
             narrative = text[:120]
 
-        prior_p = mid if im_positive(imbalance) else round(1.0 - mid, 4)
-        if trigger == "safe_compounder":
-            prior_p = round(1.0 - mid, 4)
+        prior_p = mid
         posterior_p = bayesian_posterior(prior_p, lp, ln)
 
         if compute_scalp_targets is not None:
             vol = max(0.01, spread * 2)
-            targets = compute_scalp_targets("polymarket", mid, microprice, imbalance, vol)
+            targets = compute_scalp_targets(
+                "polymarket", entry, microprice, imbalance, vol, side=side
+            )
             kelly = quarter_kelly_scalp(
                 posterior_p,
                 take_profit_pct=targets.take_profit_pct,
                 stop_loss_pct=targets.stop_loss_pct,
             )
-            tp = targets.take_profit_price
-            sl = targets.stop_loss_price
+            tp, sl = validate_long_targets(
+                entry, targets.take_profit_price, targets.stop_loss_price
+            )
             hold = targets.time_stop_seconds
             trail = targets.trailing_stop_pct
         else:
             payout_odds_b = round((1.0 - ask) / max(ask, 0.02), 3)
             kelly = quarter_kelly_scalp(posterior_p, payout_odds_b=payout_odds_b)
-            tp = round(min(0.98, ask + 0.06), 4)
-            sl = round(max(0.01, bid - 0.03), 4)
+            tp, sl = validate_long_targets(entry, ask + 0.06, bid - 0.03)
             hold = 1800
             trail = 0.02
+
+        # Veto packets whose book leans against the intended long.
+        if imbalance <= -0.45:
+            return None
 
         metrics_score = round(
             min(
@@ -684,7 +750,6 @@ class PolymarketScanner:
             ),
             2,
         )
-        # Boost classic safe compounder for liquidity/volume quality (matches prior stage2 formula)
         if trigger == "safe_compounder":
             metrics_score = max(
                 metrics_score,
@@ -697,16 +762,13 @@ class PolymarketScanner:
                 ),
             )
 
-        side = "YES" if imbalance >= 0 else "NO"
-        if trigger == "safe_compounder":
-            side = "NO"
-
         return {
             "packet_id": f"pkt_poly_{uuid.uuid4().hex[:8]}",
             "desk": "polymarket",
             "asset_id": condition_id,
             "condition_id": condition_id,
             "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
             "ticker_or_slug": slug,
             "market_slug": slug,
             "question": question,
@@ -714,6 +776,7 @@ class PolymarketScanner:
             "category_score": category_score,
             "mode": mode,
             "trigger": trigger,
+            "book_source": book_source,
             "smart_money_signal": sm_hits > 0,
             "smart_money_hits": sm_hits,
             "smart_money_max_score": sm_score,
@@ -725,6 +788,8 @@ class PolymarketScanner:
             "narrative_hint": narrative,
             "stage2_metrics_score": round(metrics_score, 2),
             "metrics_score": round(metrics_score, 2),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
             "bid": bid,
             "ask": ask,
             "q_bid": q_bid,
@@ -741,6 +806,9 @@ class PolymarketScanner:
                 "imbalance": imbalance,
                 "edge_cents": microprice_edge * 100.0,
                 "spread": spread,
+                "book_source": book_source,
+                "yes_mid": yes_mid,
+                "yes_imbalance": yes_imb,
             },
             "prior_win_prob": prior_p,
             "likelihood_pos": lp,
@@ -750,7 +818,7 @@ class PolymarketScanner:
             "quarter_kelly_pct": kelly,
             "kelly_pct": kelly,
             "side": side,
-            "entry_price": mid,
+            "entry_price": entry,
             "take_profit_price": tp,
             "stop_loss_price": sl,
             "trailing_stop_pct": trail if compute_scalp_targets else 0.02,
@@ -956,7 +1024,8 @@ class PumpFunScanner:
         mint: str,
         bonding_curve_key: str,
         creator_wallet: str,
-    ) -> Tuple[float, float]:
+    ) -> Optional[Tuple[float, float]]:
+        """Live RPC holder concentration. Returns None on failure (fail-closed)."""
         _ = creator_wallet
         payload = {
             "jsonrpc": "2.0",
@@ -970,16 +1039,18 @@ class PumpFunScanner:
                     SOLANA_PUBLIC_RPC, json=payload, timeout=5.0
                 ) as resp:
                     if resp.status != 200:
-                        return 0.05, 0.35
+                        return None
                     data = await resp.json()
             else:
                 r = await session.post(SOLANA_PUBLIC_RPC, json=payload, timeout=5.0)
                 if r.status_code >= 400:
-                    return 0.05, 0.35
+                    return None
                 data = r.json()
+            if data.get("error"):
+                return None
             accounts = ((data.get("result") or {}).get("value")) or []
             if not accounts:
-                return 0.05, 0.35
+                return None
             total_supply = 1_000_000_000.0
             non_curve_amounts: List[float] = []
             for idx, acc in enumerate(accounts):
@@ -990,11 +1061,14 @@ class PumpFunScanner:
                 if bonding_curve_key and addr == bonding_curve_key:
                     continue
                 non_curve_amounts.append(amt)
+            if not non_curve_amounts:
+                return None
             top5_pct = sum(non_curve_amounts[:5]) / total_supply
-            creator_pct = non_curve_amounts[0] / total_supply if non_curve_amounts else 0.04
+            creator_pct = non_curve_amounts[0] / total_supply
             return round(min(1.0, creator_pct), 4), round(min(1.0, top5_pct), 4)
-        except Exception:
-            return 0.05, 0.35
+        except Exception as exc:
+            logger.debug("holder RPC fail-closed for %s: %s", mint[:8], exc)
+            return None
 
     async def evaluate_matured_tokens(self, session: Any) -> None:
         now = time.time()
@@ -1041,9 +1115,16 @@ class PumpFunScanner:
                 dex_data = await self._http_json(session, f"{DEXSCREENER}/{mint}", timeout=4.5)
             except Exception:
                 pass
-            creator_pct, top5_pct = await self.fetch_top5_holders_pct(
+            holders = await self.fetch_top5_holders_pct(
                 session, mint, st.bonding_curve_key, creator
             )
+            if holders is None:
+                logger.info(
+                    "Stage 2 BLOCK: no live holder RPC for %s (fail-closed)", mint[:8]
+                )
+                del self.incubating_tokens[mint]
+                continue
+            creator_pct, top5_pct = holders
 
             wash_trade_flag = st.ping_pong_wallets >= 3
             risk_score = (

@@ -68,58 +68,6 @@ class ScalpTargets:
     stop_loss_pct: float
 
 
-def compute_scalp_targets(
-    desk: Desk | str,
-    entry_price: float,
-    microprice: float,
-    imbalance: float,
-    volatility: float,
-) -> ScalpTargets:
-    """Exact TP/SL/trail/time-stop so bots never guess exit prices.
-
-    Polymarket: +4c..+12c TP, -3c SL, 30m dead-catalyst stop.
-    Pump.fun: +45% full TP (partial marker +25%), -12% SL, -10% trail, 12m time-stop.
-    """
-    entry = float(entry_price)
-    vol = max(0.0, float(volatility))
-    imb = float(imbalance)
-    edge = float(microprice) - entry
-
-    if desk == "polymarket":
-        # Map volatility (typical 0.01–0.08 on binary books) into 4–12¢ TP.
-        tp_cents = 0.04 + min(0.08, vol * 1.5 + max(0.0, edge) * 0.5)
-        tp_cents = min(0.12, max(0.04, tp_cents))
-        # Strong imbalance slightly widens TP toward the upper bound.
-        if imb >= 0.40:
-            tp_cents = min(0.12, tp_cents + 0.02)
-        sl_cents = 0.03
-        take = entry + tp_cents
-        stop = entry - sl_cents
-        return ScalpTargets(
-            take_profit_price=round(take, 6),
-            stop_loss_price=round(max(0.01, stop), 6),
-            trailing_stop_pct=0.0,
-            time_stop_seconds=30 * 60,
-            take_profit_pct=tp_cents / max(entry, 1e-9),
-            stop_loss_pct=sl_cents / max(entry, 1e-9),
-        )
-
-    # pumpfun defaults from SCALP_PLAYBOOK
-    tp_pct = 0.45
-    sl_pct = 0.12
-    trail = 0.10
-    take = entry * (1.0 + tp_pct)
-    stop = entry * (1.0 - sl_pct)
-    return ScalpTargets(
-        take_profit_price=round(take, 12),
-        stop_loss_price=round(max(0.0, stop), 12),
-        trailing_stop_pct=trail,
-        time_stop_seconds=12 * 60,
-        take_profit_pct=tp_pct,
-        stop_loss_pct=sl_pct,
-    )
-
-
 def stage6_total(
     audit_and_copy_score: float,
     x_narrative_velocity_score: float,
@@ -137,3 +85,96 @@ def stage6_total(
 
 def mid_price(bid: float, ask: float) -> float:
     return (float(bid) + float(ask)) / 2.0
+
+
+def complement_book(
+    bid: float, ask: float, q_bid: float, q_ask: float
+) -> tuple[float, float, float, float]:
+    """Map a YES top-of-book onto the complementary NO book (and vice versa).
+
+    Identity: NO_bid ≈ 1 - YES_ask, NO_ask ≈ 1 - YES_bid (sizes swap).
+    """
+    no_bid = max(0.0, min(1.0, 1.0 - float(ask)))
+    no_ask = max(0.0, min(1.0, 1.0 - float(bid)))
+    if no_ask <= no_bid:
+        # Degenerate / locked book — nudge a tick so callers can still reject.
+        mid = (no_bid + no_ask) / 2.0
+        no_bid = max(0.0, mid - 1e-4)
+        no_ask = min(1.0, mid + 1e-4)
+    return round(no_bid, 6), round(no_ask, 6), float(q_ask), float(q_bid)
+
+
+def validate_long_targets(
+    entry: float, take_profit: float, stop_loss: float
+) -> tuple[float, float]:
+    """Ensure long TP > entry > SL; clamp without inventing edge."""
+    entry = float(entry)
+    tp = float(take_profit)
+    sl = float(stop_loss)
+    if tp <= entry:
+        tp = min(0.99, entry + 0.04)
+    if sl >= entry:
+        sl = max(0.001, entry - 0.03)
+    if sl >= entry:
+        sl = max(0.001, entry * 0.5)
+    return round(tp, 6), round(sl, 6)
+
+
+def compute_scalp_targets(
+    desk: Desk | str,
+    entry_price: float,
+    microprice: float,
+    imbalance: float,
+    volatility: float,
+    *,
+    side: str = "YES",
+) -> ScalpTargets:
+    """Exact TP/SL/trail/time-stop so bots never guess exit prices.
+
+    Polymarket: +4c..+12c TP, -3c SL, 30m dead-catalyst stop (in traded-side space).
+    Pump.fun: +45% full TP, -12% SL, -10% trail, 12m time-stop.
+
+    `side` is YES|NO|BUY|SELL. NO/SELL are still long the traded token; prices must
+    already be quoted in that token's book (do not pass YES mids for a NO trade).
+    """
+    _ = side  # traded-side prices are supplied by caller
+    entry = float(entry_price)
+    vol = max(0.0, float(volatility))
+    imb = float(imbalance)
+    edge = float(microprice) - entry
+
+    if desk == "polymarket":
+        tp_cents = 0.04 + min(0.08, vol * 1.5 + max(0.0, edge) * 0.5)
+        tp_cents = min(0.12, max(0.04, tp_cents))
+        if imb >= 0.40:
+            tp_cents = min(0.12, tp_cents + 0.02)
+        sl_cents = 0.03
+        take = entry + tp_cents
+        stop = entry - sl_cents
+        # Never floor SL above entry (bug on sub-cent mids).
+        stop = min(stop, entry - 1e-4)
+        stop = max(0.001, stop)
+        take = min(0.99, max(take, entry + 1e-4))
+        take, stop = validate_long_targets(entry, take, stop)
+        return ScalpTargets(
+            take_profit_price=round(take, 6),
+            stop_loss_price=round(stop, 6),
+            trailing_stop_pct=0.0,
+            time_stop_seconds=30 * 60,
+            take_profit_pct=tp_cents / max(entry, 1e-9),
+            stop_loss_pct=sl_cents / max(entry, 1e-9),
+        )
+
+    tp_pct = 0.45
+    sl_pct = 0.12
+    trail = 0.10
+    take = entry * (1.0 + tp_pct)
+    stop = entry * (1.0 - sl_pct)
+    return ScalpTargets(
+        take_profit_price=round(take, 12),
+        stop_loss_price=round(max(0.0, stop), 12),
+        trailing_stop_pct=trail,
+        time_stop_seconds=12 * 60,
+        take_profit_pct=tp_pct,
+        stop_loss_pct=sl_pct,
+    )

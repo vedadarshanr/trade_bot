@@ -150,3 +150,53 @@ def test_invalid_json_fail_closed(db, capsys):
     assert rc == 0  # recorded deny vote
     votes = db.votes_for("pkt_test1")
     assert votes["Adversarial-Checker"]["approve"] is False
+
+
+def test_vote_accepts_short_directive_aliases(db, capsys):
+    _seed_packet(db, "pkt_alias")
+    assert (
+        cli_vote.main(
+            [
+                "vote",
+                "--packet",
+                "pkt_alias",
+                "--seat",
+                "OnChain-Auditor",
+                "--json",
+                json.dumps({"audit_score": 80, "approve": True}),
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli_vote.main(
+            [
+                "vote",
+                "--packet",
+                "pkt_alias",
+                "--seat",
+                "Narrative-Scout",
+                "--json",
+                json.dumps({"narrative_score": 70, "timing_score": 60}),
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli_vote.main(
+            [
+                "vote",
+                "--packet",
+                "pkt_alias",
+                "--seat",
+                "Quant-Pricer",
+                "--json",
+                json.dumps({"quant_score": 75}),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Stage-6 Total_Score" in out
+    row = db.get_candidate("pkt_alias")
+    assert abs(float(row["stage6_total_score"]) - 73.0) < 1e-6

@@ -74,22 +74,46 @@ def cmd_list_pending(_: argparse.Namespace) -> int:
     return 0
 
 
+def _first_num(payload: dict[str, Any], *keys: str) -> Optional[float]:
+    for k in keys:
+        if k in payload and payload[k] is not None:
+            try:
+                return float(payload[k])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _extract_scores(seat: str, payload: dict[str, Any]) -> tuple[Optional[float], Optional[bool]]:
     approve = payload.get("approve")
     if approve is not None:
         approve = bool(approve)
     score = None
     if seat == "OnChain-Auditor":
-        score = payload.get("audit_and_copy_score", payload.get("score"))
+        # Accept directive short names + engine canonical names.
+        score = _first_num(
+            payload, "audit_and_copy_score", "audit_score", "copy_score", "score"
+        )
     elif seat == "Narrative-Scout":
-        # Prefer narrative velocity; timing stored separately in payload.
-        score = payload.get("x_narrative_velocity_score", payload.get("score"))
+        score = _first_num(
+            payload,
+            "x_narrative_velocity_score",
+            "narrative_score",
+            "x_velocity_score",
+            "score",
+        )
     elif seat == "Quant-Pricer":
-        score = payload.get("microstructure_quant_score", payload.get("score"))
+        score = _first_num(
+            payload,
+            "microstructure_quant_score",
+            "quant_score",
+            "microstructure_score",
+            "score",
+        )
     elif seat == "Adversarial-Checker":
         score = 100.0 if approve else 0.0
     elif "score" in payload:
-        score = payload.get("score")
+        score = _first_num(payload, "score")
     try:
         score_f = float(score) if score is not None else None
     except (TypeError, ValueError):
@@ -105,14 +129,30 @@ def _compute_stage6(votes: dict[str, dict[str, Any]]) -> Optional[float]:
     narr = votes["Narrative-Scout"]["payload"]
     quant = votes["Quant-Pricer"]["payload"]
     try:
-        a = float(audit.get("audit_and_copy_score", votes["OnChain-Auditor"]["score"] or 0))
-        n = float(
-            narr.get("x_narrative_velocity_score", votes["Narrative-Scout"]["score"] or 0)
+        a = _first_num(
+            audit, "audit_and_copy_score", "audit_score", "copy_score"
         )
-        t = float(narr.get("macro_timing_score", 50.0))
-        q = float(
-            quant.get("microstructure_quant_score", votes["Quant-Pricer"]["score"] or 0)
+        if a is None:
+            a = float(votes["OnChain-Auditor"]["score"] or 0)
+        n = _first_num(
+            narr,
+            "x_narrative_velocity_score",
+            "narrative_score",
+            "x_velocity_score",
         )
+        if n is None:
+            n = float(votes["Narrative-Scout"]["score"] or 0)
+        t = _first_num(narr, "macro_timing_score", "timing_score")
+        if t is None:
+            t = 50.0
+        q = _first_num(
+            quant,
+            "microstructure_quant_score",
+            "quant_score",
+            "microstructure_score",
+        )
+        if q is None:
+            q = float(votes["Quant-Pricer"]["score"] or 0)
     except (TypeError, ValueError):
         return 0.0
     return round(stage6_total(a, n, t, q), 4)
@@ -215,9 +255,16 @@ def _risk_gates(db, packet: dict[str, Any], votes: dict[str, dict[str, Any]]) ->
     if (sector_exp + notional) / decisions.paper_bankroll_usd > decisions.max_sector_concentration_pct:
         reasons.append("sector_concentration")
 
+    # Imbalance is always on the traded-side book after the NO-pricing fix.
     imb = float((packet.get("microstructure") or {}).get("imbalance") or packet.get("imbalance") or 0)
     if imb <= decisions.max_adverse_imbalance:
         reasons.append("adverse_imbalance")
+
+    entry = float(packet.get("entry_price") or 0)
+    tp = float(packet.get("take_profit_price") or 0)
+    sl = float(packet.get("stop_loss_price") or 0)
+    if entry <= 0 or tp <= entry or sl >= entry:
+        reasons.append("invalid_tp_sl_vs_entry")
 
     if decisions.live_trading_enabled and not decisions.dry_run:
         reasons.append("live_blocked_use_paper")
@@ -289,9 +336,12 @@ def cmd_execute_paper(args: argparse.Namespace) -> int:
 
 
 def cmd_run_exit_cycle(_: argparse.Namespace) -> int:
-    """Mark-to-market open fills and close on playbook exits (paper marks)."""
+    """Mark-to-market open fills with LIVE public books, then apply playbook exits."""
+    from war_room_engine.live_marks import mark_polymarket_fill, mark_pumpfun_fill
+
     db = get_db()
     closed = []
+    skipped_no_mark = []
     now = datetime.now(timezone.utc).timestamp()
     for fill in db.open_fills():
         entry = float(fill["entry_price"])
@@ -299,9 +349,27 @@ def cmd_run_exit_cycle(_: argparse.Namespace) -> int:
         peak = float(fill["peak_price"])
         imb = float(fill["imbalance"] or 0)
         desk = fill["desk"]
-        # Paper daemon without live marks: drift price slightly toward TP for demo
-        # stability — real marks come from scanners when wired. Use packet targets only.
-        # Re-evaluate using stored fields; allow optional --mark via env later.
+        cand = db.get_candidate(fill["packet_id"])
+        packet = _load_packet_json(cand["packet_json"]) if cand else {}
+
+        live = None
+        if desk == "polymarket":
+            live = mark_polymarket_fill(fill, packet)
+        else:
+            live = mark_pumpfun_fill(str(fill["asset_id"]))
+
+        if live is None:
+            # Fail-closed on marks: never invent a price or close on stale cache alone.
+            skipped_no_mark.append(fill["fill_id"])
+            continue
+
+        mark = float(live["mark"])
+        imb = float(live.get("imbalance", imb))
+        micro = float(live.get("microprice", mark))
+        peak = max(peak, mark)
+        db.update_fill_mark(fill["fill_id"], mark, peak, imb)
+        price = mark
+
         reason = None
         if desk == "polymarket":
             if price <= float(fill["stop_loss_price"]):
@@ -329,41 +397,128 @@ def cmd_run_exit_cycle(_: argparse.Namespace) -> int:
                 if now - opened >= int(fill["max_hold_seconds"]):
                     reason = "time_stop_volume_stall"
 
-        # Synthetic mark update: pull mid toward microprice memory if present
-        mark = float(fill["microprice"] or price)
-        if mark != price:
-            peak = max(peak, mark)
-            db.update_fill_mark(fill["fill_id"], mark, peak, imb)
-            price = mark
-
-        # Re-check after mark
-        if reason is None and desk == "polymarket":
-            if price <= float(fill["stop_loss_price"]):
-                reason = "stop_loss"
-            elif price >= float(fill["take_profit_price"]):
-                reason = "take_profit"
-        elif reason is None and desk == "pumpfun":
-            if price <= float(fill["stop_loss_price"]):
-                reason = "stop_loss"
-            elif price >= float(fill["take_profit_price"]):
-                reason = "take_profit"
-
         if reason:
+            # Prices are already in traded-side space; long PnL for YES and NO tokens.
             if entry > 0:
                 pnl = (price - entry) / entry * float(fill["notional_usd"])
-                if fill["side"] in ("NO", "SELL"):
-                    pnl = (entry - price) / entry * float(fill["notional_usd"])
             else:
                 pnl = 0.0
             db.close_fill(fill["fill_id"], exit_price=price, exit_reason=reason, pnl_usd=pnl)
-            closed.append({"fill_id": fill["fill_id"], "reason": reason, "pnl_usd": pnl})
+            closed.append(
+                {
+                    "fill_id": fill["fill_id"],
+                    "reason": reason,
+                    "pnl_usd": pnl,
+                    "mark": price,
+                    "microprice": micro,
+                }
+            )
             with HANDOFF_PATH.open("a", encoding="utf-8") as fh:
                 fh.write(
                     f"## Closed fill `{fill['fill_id']}` — {utcnow()}\n"
-                    f"- reason: `{reason}` pnl_usd: `{pnl:.4f}`\n\n"
+                    f"- reason: `{reason}` live_mark: `{price}` pnl_usd: `{pnl:.4f}`\n\n"
                 )
 
-    print(json.dumps({"ok": True, "closed": closed, "still_open": db.count_open_fills()}))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "closed": closed,
+                "still_open": db.count_open_fills(),
+                "skipped_no_live_mark": skipped_no_mark,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_repair_pending(_: argparse.Namespace) -> int:
+    """Recompute TP/SL/entry for pending Polymarket packets using live books."""
+    from war_room_engine.hft_math import (
+        calc_imbalance,
+        calc_microprice,
+        complement_book,
+        compute_scalp_targets,
+        mid_price,
+        validate_long_targets,
+    )
+    from war_room_engine.live_marks import fetch_clob_top
+
+    db = get_db()
+    repaired = []
+    rejected = []
+    for row in db.list_pending_candidates():
+        pkt = _load_packet_json(row["packet_json"])
+        if pkt.get("desk") != "polymarket":
+            continue
+        side = str(pkt.get("side") or "YES").upper()
+        yes_tok = str(pkt.get("yes_token_id") or "")
+        no_tok = str(pkt.get("no_token_id") or "")
+        tob = None
+        if side == "NO" and no_tok:
+            tob = fetch_clob_top(no_tok)
+        elif side != "NO" and yes_tok:
+            tob = fetch_clob_top(yes_tok)
+        elif yes_tok:
+            tob = fetch_clob_top(yes_tok)
+            if tob and side == "NO":
+                tob = complement_book(*tob)
+        if not tob:
+            rejected.append({"packet_id": row["packet_id"], "reason": "no_live_book"})
+            continue
+        bid, ask, q_bid, q_ask = tob
+        mid = mid_price(bid, ask)
+        micro = calc_microprice(bid, ask, q_bid, q_ask)
+        imb = calc_imbalance(q_bid, q_ask)
+        entry = float(ask)
+        spread = ask - bid
+        targets = compute_scalp_targets(
+            "polymarket", entry, micro, imb, max(0.01, spread * 2), side=side
+        )
+        tp, sl = validate_long_targets(
+            entry, targets.take_profit_price, targets.stop_loss_price
+        )
+        if imb <= -0.45 or tp <= entry or sl >= entry:
+            db.set_candidate_status(row["packet_id"], "rejected")
+            rejected.append(
+                {
+                    "packet_id": row["packet_id"],
+                    "reason": "adverse_or_invalid_targets",
+                    "imbalance": imb,
+                }
+            )
+            continue
+        pkt.update(
+            {
+                "bid": bid,
+                "ask": ask,
+                "q_bid": q_bid,
+                "q_ask": q_ask,
+                "entry_price": entry,
+                "take_profit_price": tp,
+                "stop_loss_price": sl,
+                "max_hold_seconds": targets.time_stop_seconds,
+                "microprice": micro,
+                "imbalance": imb,
+                "microstructure": {
+                    **(pkt.get("microstructure") or {}),
+                    "bid": bid,
+                    "ask": ask,
+                    "q_bid": q_bid,
+                    "q_ask": q_ask,
+                    "mid_price": mid,
+                    "microprice": micro,
+                    "imbalance": imb,
+                    "spread": spread,
+                    "repaired": True,
+                },
+                "repaired_at": utcnow(),
+                "status": "pending",
+            }
+        )
+        db.upsert_candidate(pkt)
+        repaired.append(row["packet_id"])
+    print(json.dumps({"ok": True, "repaired": repaired, "rejected": rejected}))
     return 0
 
 
@@ -384,8 +539,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--packet", required=True)
     sp.set_defaults(func=cmd_execute_paper)
 
-    sp = sub.add_parser("run-exit-cycle", help="Evaluate OPEN fills against exits")
+    sp = sub.add_parser("run-exit-cycle", help="Evaluate OPEN fills against live exits")
     sp.set_defaults(func=cmd_run_exit_cycle)
+
+    sp = sub.add_parser(
+        "repair-pending",
+        help="Reprice pending Polymarket packets with live traded-side books",
+    )
+    sp.set_defaults(func=cmd_repair_pending)
 
     return p
 

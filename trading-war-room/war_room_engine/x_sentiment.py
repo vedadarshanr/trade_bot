@@ -122,9 +122,80 @@ class XSentimentScorer:
 
     def __init__(self, macro_pulse_path: Path = MACRO_PULSE_PATH) -> None:
         self.macro_pulse_path = Path(macro_pulse_path)
-        self.xai_api_key = os.getenv("XAI_API_KEY", "").strip()
+        try:
+            from war_room_engine.secrets import get_secret
+
+            self.xai_api_key = get_secret("XAI_API_KEY")
+        except Exception:
+            self.xai_api_key = os.getenv("XAI_API_KEY", "").strip()
         self._macro_cache: Dict[str, Any] = {}
         self._macro_loaded_at: float = 0.0
+        self.live_x_enabled = bool(self.xai_api_key)
+
+    async def _live_x_velocity_boost(
+        self, session: Any, query: str
+    ) -> tuple[float, str]:
+        """Optional xAI Live Search. Returns (score_boost_0_20, note)."""
+        if not self.xai_api_key:
+            return 0.0, "live_x=off"
+        url = "https://api.x.ai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.xai_api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": "grok-4-fast",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return ONLY JSON: "
+                        '{"mention_accel":0-1,"breaking":true|false,"spam_ratio":0-1,'
+                        '"summary":"<=20 words"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"X/Twitter velocity for catalyst: {query[:280]}",
+                },
+            ],
+            "temperature": 0,
+        }
+        try:
+            # Support aiohttp session or httpx-like
+            if hasattr(session, "post") and "aiohttp" in type(session).__module__:
+                async with session.post(
+                    url, json=body, headers=headers, timeout=8
+                ) as resp:
+                    if resp.status >= 400:
+                        return 0.0, f"live_x_http={resp.status}"
+                    data = await resp.json()
+            else:
+                resp = await session.post(url, json=body, headers=headers, timeout=8.0)
+                status = getattr(resp, "status_code", getattr(resp, "status", 0))
+                if status >= 400:
+                    return 0.0, f"live_x_http={status}"
+                data = resp.json() if callable(getattr(resp, "json", None)) else await resp.json()
+            content = (
+                ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                or "{}"
+            )
+            # Strip fences if model wraps JSON
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.strip("`")
+                if content.startswith("json"):
+                    content = content[4:].strip()
+            parsed = json.loads(content) if isinstance(content, str) else content
+            accel = float(parsed.get("mention_accel") or 0.0)
+            breaking = bool(parsed.get("breaking"))
+            spam = float(parsed.get("spam_ratio") or 0.0)
+            boost = min(20.0, max(0.0, accel * 14.0 + (6.0 if breaking else 0.0) - spam * 10.0))
+            summary = str(parsed.get("summary") or "live-x")[:80]
+            return boost, f"live_x={summary}"
+        except Exception as exc:
+            logger.debug("live X enrichment skipped: %s", exc)
+            return 0.0, "live_x=error"
 
     def get_macro_pulse(self) -> Dict[str, Any]:
         """Read macro_pulse.json with a 60s in-memory buffer; self-heal if missing."""
@@ -306,7 +377,6 @@ class XSentimentScorer:
         smart_money_side: str = "NONE",
     ) -> SentimentSignal:
         """Breaking-news velocity + turnover urgency for a Polymarket scalp."""
-        _ = session
         macro = self.get_macro_pulse()
         timing_score = float(macro.get("timing_score", 75.0))
 
@@ -325,6 +395,11 @@ class XSentimentScorer:
         if smart_money_hits > 0:
             score += min(20.0, smart_money_hits * 11.0)
 
+        live_boost, live_note = await self._live_x_velocity_boost(
+            session, f"{question} {slug}"
+        )
+        score += live_boost
+
         exhaustion_risk = "LOW"
         if mid_price >= 0.93 or mid_price <= 0.07:
             exhaustion_risk = "MEDIUM"
@@ -341,7 +416,7 @@ class XSentimentScorer:
         hint = (
             f"Cat={category} | Turnover={turnover_ratio:.2f}x | "
             f"Imbalance={imbalance:+.2f} | SmartWallets={smart_money_hits} ({smart_money_side}) | "
-            f"Catalyst={kw_str}"
+            f"Catalyst={kw_str} | {live_note}"
         )
 
         return SentimentSignal(

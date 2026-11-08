@@ -1,5 +1,5 @@
 # SMART_WALLETS.md — Live Smart-Money Copy-Trading Watchlist
-> **Last Auto-Refreshed:** `2026-11-08 07:23:12 UTC` by `war_room_engine/copy_tracker.py`
+> **Last Auto-Refreshed:** `2026-11-08 08:00:29 UTC` by `war_room_engine/copy_tracker.py`
 > **Usage:** Read by `OnChain-Auditor` (Seat 2) and `Chief-Dispatcher` (Seat 1).
 
 ## Table A: Top Polymarket Smart-Money Scalpers (`/v2/leaderboard` Filtered)

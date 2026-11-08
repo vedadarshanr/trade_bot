@@ -24,10 +24,17 @@ Bot seats:
 
 ```bash
 python3 war_room_engine/cli_vote.py list-pending
+python3 war_room_engine/cli_vote.py repair-pending   # live-reprice pending packets
 python3 war_room_engine/cli_vote.py vote --packet <ID> --seat OnChain-Auditor --json '{"audit_and_copy_score":80,"approve":true}'
+# Short directive aliases also work: audit_score / narrative_score / quant_score
 python3 war_room_engine/cli_vote.py execute-paper --packet <ID>
-python3 war_room_engine/cli_vote.py run-exit-cycle
+python3 war_room_engine/cli_vote.py run-exit-cycle   # live CLOB/Dex marks only
 ```
+
+Optional secrets (paper still uses public books without them) — put in `.env` or paste in chat:
+
+- `XAI_API_KEY` — live X velocity via Grok
+- `SOLANA_RPC_URL` — holder concentration RPC
 
 ## Layout
 

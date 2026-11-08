@@ -73,5 +73,9 @@ async def test_polymarket_scanner_safe_compounder(emitter, monkeypatch):
     pkt = json.loads(pending[0]["packet_json"])
     assert pkt["trigger"] == "safe_compounder"
     assert pkt["desk"] == "polymarket"
-    assert "take_profit_price" in pkt
+    assert pkt["side"] == "NO"
+    # NO must be priced in NO-token space (complement of YES 0.14/0.16 → 0.84/0.86).
+    assert pkt["entry_price"] == pkt["ask"]
+    assert abs(pkt["ask"] - 0.86) < 1e-9
+    assert pkt["take_profit_price"] > pkt["entry_price"] > pkt["stop_loss_price"]
     assert "kelly_pct" in pkt
